@@ -252,22 +252,43 @@ static UCHAR *seek_token_end(UCHAR *s)
 	return s;
 }
 
-static UCHAR *opcmp(UCHAR *q, UCHAR *s)
-{
-	int i;
-	for (i = 0; i < 8; i++) {
-		if (q[i] == ' ' && (s[i] <= ' ' || s[i] == ';'))
-			goto match;
-		if (q[i] != s[i])
-			goto mismatch;
+//static UCHAR *opcmp(UCHAR *q, UCHAR *s)
+//{
+//	int i;
+//	for (i = 0; i < 8; i++) {
+//		if (q[i] == ' ' && (s[i] <= ' ' || s[i] == ';'))
+//			goto match;
+//		if (q[i] != s[i])
+//			goto mismatch;
+//	}
+//	if (s[i] <= ' ' || s[i] == ';')
+//		goto match;
+//mismatch:
+//	return NULL;
+//match:
+//	return skipspace(&s[i]);
+//}
+
+/*重写opcmp：取消8字符限制（为支持更长的指令） */
+static UCHAR *opcmp(UCHAR *q, UCHAR *s){ 
+	while(*q && *q!=' '){
+		if(*q!=*s) goto mismatch;
+		q++;s++;
 	}
-	if (s[i] <= ' ' || s[i] == ';')
-		goto match;
+	if(*s<=' ' || *s==';')goto match;
 mismatch:
 	return NULL;
 match:
-	return skipspace(&s[i]);
+	return skipspace(s);
 }
+
+/* NEW: 取消8字符限制后，寻找nasm指令不再是固定位置，要一个辅助函数 */
+static UCHAR *tbl_nasm(UCHAR *p){
+	while(*p && *p!=' ')p++;
+	while(*p==' ')p++;
+	return p;
+}
+
 
 static char my_strcmp(const char *s, const char *t)
 {
@@ -280,12 +301,32 @@ static char my_strcmp(const char *s, const char *t)
 	return 0;
 }
 
+/* NEW: 处理lock/rep指令的辅助函数 */
+static const char *get_prefix(UCHAR *s, int len)
+{
+	if (len == 4 && s[0]=='l' && s[1]=='o' && s[2]=='c' && s[3]=='k')
+		return "LOCK ";
+	if (len == 3 && s[0]=='r' && s[1]=='e' && s[2]=='p')
+		return "REP ";
+	if (len == 4 && s[0]=='r' && s[1]=='e' && s[2]=='p' && s[3]=='e')
+		return "REPE ";
+	if (len == 4 && s[0]=='r' && s[1]=='e' && s[2]=='p' && s[3]=='z')
+		return "REPZ ";
+	if (len == 5 && s[0]=='r' && s[1]=='e' && s[2]=='p' && s[3]=='n' && s[4]=='e')
+		return "REPNE ";
+	if (len == 5 && s[0]=='r' && s[1]=='e' && s[2]=='p' && s[3]=='n' && s[4]=='z')
+		return "REPNZ ";
+	return NULL;
+}
+
+
+
 static UCHAR *convmain(UCHAR *src0, UCHAR *src1, UCHAR *dest0, UCHAR *dest1, struct STR_FLAGS flags)
 {
 	UCHAR *p, *q, *r, *s, *t;
 	UCHAR intext = 0, c, flag, flag1, flag2;
 	/*update:扩充指令表*/
-	static UCHAR no_params[][16] = {
+	static UCHAR no_params[][32] = {
 		"cld     CLD",
 		"cltd    CDQ",
 		"cmpsb   CMPSB",
@@ -330,10 +371,15 @@ static UCHAR *convmain(UCHAR *src0, UCHAR *src1, UCHAR *dest0, UCHAR *dest1, str
 		"lodsl   LODSD",
 		"scasl   SCASD",
 		"cmpsl   CMPSD",
+		"movsw   MOVSW",
+		"stosw   STOSW",
+		"scasw   SCASW",
+		"cmpsw   CMPSW",
+		"lodsw   LODSW",
 		/*到此结束*/
 		"\0"
 	};
-	static UCHAR one_param[][16] = {
+	static UCHAR one_param[][32] = {
 		"0call    CALL",
 		"1decb    DEC",
 		"4decl    DEC",
@@ -465,11 +511,22 @@ static UCHAR *convmain(UCHAR *src0, UCHAR *src1, UCHAR *dest0, UCHAR *dest1, str
 		"1setng   SETLE",
 		"1setnge  SETL",
 		"1setnl   SETGE",
-		"1setnle  SETG",		
+		"1setnle  SETG",	
+		/*其他重要指令*/
+		"4bswap  BSWAP",
+		"4bswapl BSWAP",
+		"2pushw  PUSH",
+		"2popw   POP",
+		"0loope  LOOPE",
+		"0loopz  LOOPE",
+		"0loopne LOOPNE",
+		"0loopnz LOOPNE",
+		"0jcxz   JCXZ",
+		"8cmpxchg8b CMPXCHG8B",
 		/*到此结束*/
 		"\0"
 	};
-	static UCHAR one_shifts[][16] = {
+	static UCHAR one_shifts[][32] = {
 		"1salb    SAL",
 		"4sall    SAL",
 		"2salw    SAL",
@@ -481,7 +538,7 @@ static UCHAR *convmain(UCHAR *src0, UCHAR *src1, UCHAR *dest0, UCHAR *dest1, str
 		"2shrw    SHR",
 		"\0"
 	};
-	static UCHAR two_params[][16] = {
+	static UCHAR two_params[][32] = {
 		"1addb    ADD",
 		"4addl    ADD",
 		"2addw    ADD",
@@ -546,6 +603,16 @@ static UCHAR *convmain(UCHAR *src0, UCHAR *src1, UCHAR *dest0, UCHAR *dest1, str
 		"4xorl    XOR",
 		"2xorw    XOR",
 		/*以下新增*/
+		"2btw    BT",
+		"4btl    BT",
+		"2btsw   BTS",
+		"4btsl   BTS",
+		"2btrw   BTR",
+		"4btrl   BTR",
+		"2btcw   BTC",
+		"4btcl   BTC",
+		"1sbbb    SBB",
+		"2sbbw    SBB",
 		"1shlb    SHL",
 		"4shll    SHL",
 		"2shlw    SHL",	
@@ -555,17 +622,91 @@ static UCHAR *convmain(UCHAR *src0, UCHAR *src1, UCHAR *dest0, UCHAR *dest1, str
 		"1rorb    ROR",
 		"4rorl    ROR",
 		"2rorw    ROR",
+		"1xaddb   XADD",
+		"2xaddw   XADD",
+		"4xaddl   XADD",
+		"1cmpxchgb CMPXCHG",
+		"4cmpxchgl CMPXCHG",
+		"2cmpxchgw CMPXCHG",
+		/*CMOVcc系列*/
+		"4cmovol  CMOVO",
+		"4cmovnol CMOVNO",
+		"4cmovbl  CMOVB",
+		"4cmovael CMOVAE",
+		"4cmovel  CMOVE",
+		"4cmovnel CMOVNE",
+		"4cmovbel CMOVBE",
+		"4cmoval  CMOVA",
+		"4cmovsl  CMOVS",
+		"4cmovnsl CMOVNS",
+		"4cmovpl  CMOVP",
+		"4cmovnpl CMOVNP",
+		"4cmovll  CMOVL",
+		"4cmovgel CMOVGE",
+		"4cmovlel CMOVLE",
+		"4cmovgl  CMOVG",	
+		"4cmovcl  CMOVB",
+		"4cmovncl CMOVAE",
+		"4cmovzl  CMOVE",
+		"4cmovnzl CMOVNE",
+		"4cmovnal CMOVBE",
+		"4cmovnael CMOVB",
+		"4cmovnbl  CMOVAE",
+		"4cmovnbel CMOVA",
+		"4cmovpel  CMOVP",
+		"4cmovpol  CMOVNP",
+		"4cmovngel CMOVL",
+		"4cmovnll  CMOVGE",
+		"4cmovngl  CMOVLE",
+		"4cmovnlel CMOVG",
+		/*GCC也可能这么输出*/
+		"4cmovo  CMOVO",
+		"4cmovno CMOVNO",
+		"4cmovb  CMOVB",
+		"4cmovae CMOVAE",
+		"4cmove  CMOVE",
+		"4cmovne CMOVNE",
+		"4cmovbe CMOVBE",
+		"4cmova  CMOVA",
+		"4cmovs  CMOVS",
+		"4cmovns CMOVNS",
+		"4cmovp   CMOVP",
+		"4cmovnp  CMOVNP",
+		"4cmovl   CMOVL",
+		"4cmovge  CMOVGE",
+		"4cmovle  CMOVLE",
+		"4cmovg   CMOVG",	
+		"4cmovc   CMOVB",
+		"4cmovnc  CMOVAE",
+		"4cmovz   CMOVE",
+		"4cmovnz  CMOVNE",
+		"4cmovna  CMOVBE",
+		"4cmovnae  CMOVB",
+		"4cmovnb   CMOVAE",
+		"4cmovnbe  CMOVA",
+		"4cmovpe   CMOVP",
+		"4cmovpo   CMOVNP",
+		"4cmovnge  CMOVL",
+		"4cmovnl   CMOVGE",
+		"4cmovng   CMOVLE",
+		"4cmovnle  CMOVG",	
 		/*到此结束*/
 		"\0"
 	};
 
-	static UCHAR three_params[][16] = {
+	static UCHAR three_params[][32] = {
 		"4imull   IMUL",
 		"2imulw   IMUL",
+		/*以下新增*/
+		"2shldw   SHLD",
+		"4shldl   SHLD",
+		"2shrdw   SHRD",
+		"4shrdl   SHRD",
+		/*到此结束*/
 		"\0"
 	};
 
-	static UCHAR fdivfsub[][16] = {
+	static UCHAR fdivfsub[][32] = {
 		"1fdiv    FDIV",
 		"0fdivr   FDIV",
 		"1fsub    FSUB",
@@ -654,7 +795,7 @@ static UCHAR *convmain(UCHAR *src0, UCHAR *src1, UCHAR *dest0, UCHAR *dest1, str
 				flag2 = 1;	//这里要改成1
 				goto ext_skip2;
 			}
-			/*update*/
+			/*NEW*/
 			/*避免.comm/.lcomm中的内容被识别为外部符号*/
 			/*从此开始*/
 			if ((r[1]=='c' && r[2]=='o' && r[3]=='m' && r[4]=='m' && r[5] <= ' ') ||
@@ -939,7 +1080,7 @@ ext_skip2:
 			    flag2 = 1;
 				goto skip;
 			}
-			/* update:.comm/.lcomm */
+			/* NEW: 支持.comm/.lcomm */
 			
 			/*新增：.comm*/
 			/*这个在使用静态变量的场景常出现*/
@@ -1032,6 +1173,9 @@ ext_skip2:
 			}
 			if (src0[1] == 's' && src0[2] == 'p' && src0[3] == 'a' && src0[4] == 'c' && src0[5] == 'e' && src0[6] <= ' ') {
 				/* .space */
+				/* yi_xi_yun注：非.bss段实际上不应该用RESB而是用TIMES N DB 0 
+				但实际上因非.bss段是物理上写入文件的，nasm规定此时使用RESB等价于用0填充 
+				故这种写法理论上正确，只是会被nasm报警告*/
 				src0 = skipspace(src0 + 6);
 				p = getparam(src0);
 				output(6, "\tRESB\t");
@@ -1172,14 +1316,32 @@ retry:
 		}
 		output(1, "\t");
 
-		if (p - src0 > 8)
+		/*NEW : 检测前缀*/
+		const char *pfx = get_prefix(src0, p - src0);
+		if (pfx != NULL) {
+			UCHAR *nxt = skipspace(p);
+			if (*nxt != '\n' && *nxt != ';' && *nxt != '\0') {
+				int plen = 0;
+				while (pfx[plen])
+					plen++;
+				output(plen, (UCHAR *)pfx);
+				src0 = nxt;
+				p = src0;
+				do {
+					p++;
+				} while (*p > ' ' && *p != ';');
+			}
+		}	
+		/*到此结束*/
+		
+		if (p - src0 > 16)
 			goto unknown;
-
+			
 		/* 无参数指令 */
 		for (i = 0; q = &no_params[i][0], *q != '\0'; i++) {
 			if (r = opcmp(&q[0], src0)) {
 				if (*r == '\n' || *r == ';') { /* 有参数就跳过 */
-					output(strlen(&q[8]), &q[8]);
+					output(strlen(tbl_nasm(q)),tbl_nasm(q)); //取消8字符限制 
 					output(LEN_NL, NL);
 					goto skip;
 				}
@@ -1220,7 +1382,7 @@ retry:
 						break;
 					if (*r == ',')
 						break;
-					output(strlen(&q[9]), &q[9]);
+					output(strlen(tbl_nasm(q+1)),tbl_nasm(q+1)); //取消8字符限制
 					output(1, "\t");
 					convparam(p, *q - '0');
 					output(LEN_NL, NL);
@@ -1238,7 +1400,7 @@ retry:
 						break;
 					if (*r == ',')
 						break;
-					output(strlen(&q[9]), &q[9]);
+					output(strlen(tbl_nasm(q+1)),tbl_nasm(q+1)); //取消8字符限制 
 					output(1, "\t");
 					convparam(p, *q - '0');
 					output(2 + LEN_NL, ",1" NL);
@@ -1261,7 +1423,7 @@ retry:
 						break;
 					if (*s == ',')
 						break;
-					output(strlen(&q[9]), &q[9]);
+					output(strlen(tbl_nasm(q+1)),tbl_nasm(q+1)); //取消8字符限制
 					output(1, "\t");
 					convparam(r + 1, *q - '0');
 					output(1, ",");
@@ -1291,7 +1453,7 @@ retry:
 						break;
 					if (*t == ',')
 						break;
-					output(strlen(&q[9]), &q[9]);
+					output(strlen(tbl_nasm(q+1)),tbl_nasm(q+1)); //取消8字符限制
 					output(1, "\t");
 					convparam(s + 1, *q - '0');
 					output(1, ",");
