@@ -319,6 +319,12 @@ static const char *get_prefix(UCHAR *s, int len)
 	return NULL;
 }
 
+/* NEW: 处理段超越前缀的辅助函数*/
+static int is_seg_prefix(UCHAR *p){
+	return p[0] == '%' && p[3] == ':' && p[2] == 's'
+	    && (p[1] == 'c' || p[1] == 'd' || p[1] == 'e'
+	     || p[1] == 'f' || p[1] == 'g' || p[1] == 's');
+}
 
 
 static UCHAR *convmain(UCHAR *src0, UCHAR *src1, UCHAR *dest0, UCHAR *dest1, struct STR_FLAGS flags)
@@ -628,6 +634,10 @@ static UCHAR *convmain(UCHAR *src0, UCHAR *src1, UCHAR *dest0, UCHAR *dest1, str
 		"1cmpxchgb CMPXCHG",
 		"4cmpxchgl CMPXCHG",
 		"2cmpxchgw CMPXCHG",
+		"3movaps  MOVAPS",
+		"3movups  MOVUPS",
+		"3movdqa  MOVDQA",
+		"3movdqu  MOVDQU",
 		/*CMOVcc系列*/
 		"4cmovol  CMOVO",
 		"4cmovnol CMOVNO",
@@ -1513,6 +1523,13 @@ err:
 static UCHAR *checkparam(UCHAR *p)
 {
 	p = skipspace(p);
+	/*NEW*/
+	/*若有段超越前缀，去除并将剩余部分按mem解析*/
+	if(is_seg_prefix(p)){
+		p=skipspace(p+4);
+		goto mem;
+	}
+	
 	if (*p == '%') { /* reg */
 		p = skipspace(p + 1);
 		if (*p == ',')
@@ -1546,7 +1563,8 @@ static UCHAR *checkparam(UCHAR *p)
 		goto err;
 	if (*p == ';')
 		goto err;
-
+		
+mem:
 	/* mem */
 	if (*p != '(') {
 		do {
@@ -1615,6 +1633,24 @@ static void convparam(UCHAR *p, int i)
 	UCHAR c, *q;
 retry:
 	p = skipspace(p);
+	/*NEW*/
+	/*段超越前缀*/
+	if(is_seg_prefix(p)){
+		UCHAR s1 = p[1], s2 = p[2];
+		p += 4;
+		if (i == 1)      output(6, "BYTE [");
+		else if (i == 2) output(6, "WORD [");
+		else if (i == 3) output(1, "[");
+		else if (i == 4) output(7, "DWORD [");
+		else if (i == 8) output(7, "QWORD [");
+		else if (i == 9) output(7, "TWORD [");
+		if ('a' <= s1 && s1 <= 'z') s1 -= 32;
+		if ('a' <= s2 && s2 <= 'z') s2 -= 32;
+		output(1, &s1);
+		output(1, &s2);
+		output(1, ":");
+		goto mem2;
+	}
 	if (*p == '%') { /* reg */
 		p = skipspace(p + 1);
 		if (p[0] == 's' && p[1] == 't' && p[2] != '(') {
@@ -1703,6 +1739,7 @@ mem:
 		output(7, "QWORD [");
 	if (i == 9)
 		output(7, "TWORD [");
+mem2: 
 	c = 0;
 	if (*p != '(') {
 		do {
