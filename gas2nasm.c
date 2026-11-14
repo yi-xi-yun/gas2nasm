@@ -3,6 +3,8 @@
 */
 
 #include <windows.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 typedef unsigned char UCHAR;
 typedef unsigned int UINT;
@@ -17,6 +19,8 @@ static UCHAR *dest0_, *dest1_;
 #define FLAG_B		5
 #define FLAG_a		6
 #define FLAG_e		7
+#define FLAG_no_extern	8
+#define FLAG_i		9
 
 #define	NL			"\r\n"
 #define	LEN_NL		2
@@ -27,7 +31,7 @@ static UCHAR *dest0_, *dest1_;
 #define SECTION_RDATA	3
 
 struct STR_FLAGS {
-	UCHAR opt[8];
+	UCHAR opt[16];
 };
 
 struct stack_alloc {
@@ -51,88 +55,208 @@ static char errflag = 0;
 
 static UCHAR *param_p[6];
 
-int main(int argc, char **argv)
-{
-	struct stack_alloc *pwork;
-	UCHAR *p0, *f, *src1, *filename, i = 0;
-	struct STR_FLAGS flags;
-	int j;
+static const char *VERSION="gas2nasm" NL "Copyright(C) 2004 H.Kawai, 2026 yi_xi_yun." NL;
 
-	pwork = (struct stack_alloc *) malloc(sizeof (struct stack_alloc));
+static const char *USAGE=	"Usage: gas2nasm [options] input.s [output.asm]" NL
+							"       gas2nasm [options] -o output.asm input.s" NL
+							"Options:" NL
+							"  -h          Display this information." NL
+					        "  -v          Display version information." NL
+					        "  -o <file>   Place the output into <file>." NL
+					        "  -a          Ignore .balign 2 in SECTION .text." NL
+					        "  -t<N>       Align SECTION .text to N bytes after the header." NL
+					        "  -d<N>       Align SECTION .data to N bytes after the header." NL
+					        "  -b<N>       Align SECTION .bss  to N bytes after the header." NL
+					        "  -T<N>       Replace [SECTION .text] with [SECTION .text align=N]." NL
+					        "  -D<N>       Replace [SECTION .data] with [SECTION .data align=N]." NL
+					        "  -B<N>       Replace [SECTION .bss]  with [SECTION .bss  align=N]." NL
+					        "  -e          Expand _lib_execcmd (dedicated to OSASK)." NL
+					        "  -no-extern  Remove EXTERN directives." NL
+							"  -i          Inline-expand libc calls to remove library dependencies." NL;
+
+int inline_counter;
+        
+
+static UCHAR *derive_output(const UCHAR *input)
+{
+	size_t len = (size_t)GO_strlen(input);
+	UCHAR *out = (UCHAR *)malloc(len + 5);
+	char *dot, *sep1, *sep2, *sep;
+
+	if (out == NULL)
+		errout("out of memory!" NL);
+
+	strcpy((char *)out, (const char *)input);
+
+	dot  = strrchr((char *)out, '.');
+	sep1 = strrchr((char *)out, '\\');
+	sep2 = strrchr((char *)out, '/');
+	sep  = (sep1 > sep2) ? sep1 : sep2;
+
+	if (dot != NULL && dot > sep) {
+		strcpy(dot, ".asm");
+	} else {
+		strcat((char *)out, ".asm");
+	}
+	return out;
+}
+
+static void usage_error(const char *msg)
+{
+	msgout("gas2nasm: error: ");
+	msgout(msg);
+	msgout(NL);
+	msgout("Try 'gas2nasm -h' for more information." NL);
+	GOLD_exit(2);
+}
+						
+int main(int argc, char **argv){
+	struct stack_alloc *pwork;
+	UCHAR *src1, *outfilename;
+	struct STR_FLAGS flags;
+	int j, i, n_files = 0;
+	UCHAR *files[2];
+	const char *output_arg = NULL;
 
 	for (j = 0; j < 8; j++)
 		flags.opt[j] = 0;
 
-	while (--argc) {
-		p0 = *++argv;
-		if (*p0 == '-') {
-			while (*++p0) {
-				if (*p0 == 'a')
+	/* 参数解析 */
+	for (i = 1; i < argc; i++) {
+		UCHAR *arg = (UCHAR *)argv[i];
+
+		if (arg[0] == '-' && arg[1] != '\0') {
+			UCHAR *p = arg + 1;
+			while (*p) {
+				switch (*p) {
+				case 'a':
 					flags.opt[FLAG_a] = 1;
-				if (*p0 == 'e')
+					p++;
+					break;
+				case 'e':
 					flags.opt[FLAG_e] = 1;
-				if (*p0 == 'd') {
-					j = FLAG_d;
-	getparam:
-					do {
-						p0++;
-					} while (*p0 != '\0' && *p0 <= ' ');
-					if (*p0 == '\0') {
-						p0 = *++argv;
-						argc--;
-						if (argc > 1)
-							goto getparam;
-						flags.opt[j] = 0;
-						goto skip;
+					p++;
+					break;
+				case 'i':	/*新增：C库函数的内联展开*/
+					flags.opt[FLAG_i] = 1;
+					p++;
+					break;
+				case 'h':
+					msgout(VERSION);
+					msgout(USAGE);
+					msgout(NL);
+					return 0;
+				case 'v':
+					msgout(VERSION);
+					msgout(NL);
+					return 0;
+				case 'o':
+					p++;
+					if (*p) {
+						/* -oFILE 紧贴形式 */
+						output_arg = (const char *)p;
+						while (*p) p++;
+					} else {
+						/* -o FILE 分离形式 */
+						if (++i >= argc)
+							usage_error("-o requires an argument");
+						output_arg = argv[i];
 					}
-					param_p[j] = p0;
-					while ('0' <= *p0 && *p0 <= '9')
-						p0++;
-					flags.opt[j] = p0 - param_p[j];
-					p0--; /* 为了下一次循环 */
-					continue;
+					break;
+				case 't': case 'd': case 'b':
+				case 'T': case 'D': case 'B': {
+					int fj;
+					UCHAR *q;
+					switch (*p) {
+					case 't': fj = FLAG_t; break;
+					case 'd': fj = FLAG_d; break;
+					case 'b': fj = FLAG_b; break;
+					case 'T': fj = FLAG_T; break;
+					case 'D': fj = FLAG_D; break;
+					default:  fj = FLAG_B; break;  /* 'B' */
+					}
+					p++;
+					if (*p == '\0') {
+						/* 分离形式：-T 4 */
+						if (++i >= argc || argv[i][0] == '-')
+							usage_error("-T/-D/-B/-t/-d/-b requires a numeric argument");
+						param_p[fj] = (UCHAR *)argv[i];
+						q = param_p[fj];
+						while (*q >= '0' && *q <= '9') q++;
+						flags.opt[fj] = q - param_p[fj];
+						if (flags.opt[fj] == 0)
+							usage_error("-T/-D/-B/-t/-d/-b requires a numeric argument");
+						/* p 仍指向 '\0'，内层循环退出 */
+					} else {
+						/* 紧贴形式：-T4 */
+						param_p[fj] = p;
+						q = p;
+						while (*q >= '0' && *q <= '9') q++;
+						flags.opt[fj] = q - p;
+						if (flags.opt[fj] == 0)
+							usage_error("-T/-D/-B/-t/-d/-b requires a numeric argument");
+						p = q;
+					}
+					break;
 				}
-				if (*p0 == 'b') {
-					j = FLAG_b;
-					goto getparam;
-				}
-				if (*p0 == 't') {
-					j = FLAG_t;
-					goto getparam;
-				}
-				if (*p0 == 'D') {
-					j = FLAG_D;
-					goto getparam;
-				}
-				if (*p0 == 'B') {
-					j = FLAG_B;
-					goto getparam;
-				}
-				if (*p0 == 'T') {
-					j = FLAG_T;
-					goto getparam;
+				case 'n':
+					if(strcmp(p,"no-extern")==0){
+						flags.opt[FLAG_no_extern]=1;
+						p++;
+						goto next;
+					}
+					usage_error("unknown option");
+				default:
+					usage_error("unknown option");
 				}
 			}
 		} else {
-			filename = p0;
-			if (i == 0)
-				src1 = readfile(filename, pwork->ibuf, pwork->ibuf + sizeof (pwork->ibuf));
-			i++;
+			if (n_files >= 2)
+				usage_error("too many input files");
+			files[n_files++] = arg;
 		}
+next:
+		continue;
 	}
-skip:
-	if (i != 2) {
-		errout("gas2nasm" NL "Copyright(C) 2004 H.Kawai, 2026 yi_xi_yun." NL
-			"usage : >gas2nasm input-file output-file" NL);
+
+	/* 参数组合校验 */
+	if (n_files == 0)
+		usage_error("no input file");
+
+	if (output_arg != NULL) {
+		if (n_files >= 2)
+			usage_error("output file already specified");
+		outfilename = (UCHAR *)output_arg;
+	} else if (n_files == 2) {
+		outfilename = files[1];
+	} else {
+		outfilename = derive_output(files[0]);
 	}
+
+	/* 分配 8MB 缓冲 */
+	pwork = (struct stack_alloc *) malloc(sizeof (struct stack_alloc));
+	if (pwork == NULL)
+		errout("out of memory!" NL);
+
+	src1 = readfile(files[0], pwork->ibuf, pwork->ibuf + sizeof (pwork->ibuf));
+	
+	/* NEW: 确保输入以 \n 结尾。
+	 * 原 convmain 的解析逻辑假设每行以 \n 结尾，输入末尾无换行时，会拒绝处理。 */
+	if(src1>pwork->ibuf && src1[-1]!=0x0a){
+		fprintf(stdout, "gas2nasm: warning: no newline at end of file" NL);
+		*src1++=0x0d; *src1++=0x0a;
+	}
+	 
+	
 	src1 = convmain(pwork->ibuf, src1, pwork->obuf, pwork->obuf + sizeof (pwork->obuf), flags);
 	if (src1 == NULL)
 		errout("output filebuf over!" NL);
-	if (GOLD_write_t(filename, src1 - pwork->obuf, pwork->obuf))
-		errout_s_NL("can't write file: ", filename);
+	if (GOLD_write_t(outfilename, src1 - pwork->obuf, pwork->obuf))
+		errout_s_NL("can't write file: ", outfilename);
 
-	return errflag;
+	return errflag;	
 }
+
 
 static void output(UINT l, UCHAR *s)
 {
@@ -146,6 +270,18 @@ static void output(UINT l, UCHAR *s)
 		}
 	}
 	return;
+}
+
+static void outputf(const char *format, ...){
+	char buf[512];
+	va_list ap;
+	size_t n;
+	if(dest0_==NULL)return;
+	va_start(ap,format);
+	n=vsprintf(buf,format,ap);
+	if(n>=sizeof(buf))n=sizeof(buf)-1;
+	output(n,buf);
+	va_end(ap);
 }
 
 void msgout0(int len, UCHAR *s)
@@ -325,6 +461,126 @@ static int is_seg_prefix(UCHAR *p){
 	    && (p[1] == 'c' || p[1] == 'd' || p[1] == 'e'
 	     || p[1] == 'f' || p[1] == 'g' || p[1] == 's');
 }
+
+/*NEW: -i选项下，C库函数的内联展开*/
+/*支持strlen/strcpy/strcmp/strcat/memcpy/memset*/
+static void inline_strlen(void){
+	int id = inline_counter++;
+	outputf("\tMOV ECX,[ESP]" NL);
+	outputf(".Lstrlen_%d_align:" NL, id);
+	outputf("\tTEST ECX,3" NL);
+	outputf("\tJZ .Lstrlen_%d_loop" NL, id);
+	outputf("\tCMP BYTE [ECX],0" NL);
+	outputf("\tJE .Lstrlen_%d_found" NL, id);
+	outputf("\tINC ECX" NL);
+	outputf("\tJMP .Lstrlen_%d_align" NL, id);
+	outputf(".Lstrlen_%d_loop:" NL, id);
+	outputf("\tMOV EDX,[ECX]" NL);
+	outputf("\tMOV EAX,EDX" NL);
+	outputf("\tSUB EAX,0x01010101" NL);
+	outputf("\tNOT EDX" NL);
+	outputf("\tAND EAX,EDX" NL);
+	outputf("\tAND EAX,0x80808080" NL);
+	outputf("\tJNZ .Lstrlen_%d_found4" NL, id);
+	outputf("\tADD ECX,4" NL);
+	outputf("\tJMP .Lstrlen_%d_loop" NL, id);
+	outputf(".Lstrlen_%d_found4:" NL, id);
+	outputf("\tBSF EAX,EAX" NL);
+	outputf("\tSHR EAX,3" NL);
+	outputf("\tADD ECX,EAX" NL);
+	outputf(".Lstrlen_%d_found:" NL, id);
+	outputf("\tMOV EAX,ECX" NL);
+	outputf("\tSUB EAX,[ESP]" NL);
+}
+static void inline_strcpy(void){
+	int id = inline_counter++;
+	outputf("\tMOV EDX,[ESP]" NL);
+	outputf("\tMOV ECX,[ESP+4]" NL);
+	outputf(".Lstrcpy_%d_loop:" NL, id);
+	outputf("\tMOV AL,[ECX]" NL);
+	outputf("\tMOV [EDX],AL" NL);
+	outputf("\tINC ECX" NL);
+	outputf("\tINC EDX" NL);
+	outputf("\tTEST AL,AL" NL);
+	outputf("\tJNZ .Lstrcpy_%d_loop" NL, id);
+	outputf("\tMOV EAX,[ESP]" NL);
+}
+static void inline_strcat(void){
+	int id = inline_counter++;
+	outputf("\tMOV EDX,[ESP]" NL);
+	outputf("\tMOV ECX,[ESP+4]" NL);
+	outputf(".Lstrcat_%d_find:" NL, id);
+	outputf("\tCMP BYTE [EDX],0" NL);
+	outputf("\tJE .Lstrcat_%d_append" NL, id);
+	outputf("\tINC EDX" NL);
+	outputf("\tJMP .Lstrcat_%d_find" NL, id);
+	outputf(".Lstrcat_%d_append:" NL, id);
+	outputf("\tMOV AL,[ECX]" NL);
+	outputf("\tMOV [EDX],AL" NL);
+	outputf("\tINC ECX" NL);
+	outputf("\tINC EDX" NL);
+	outputf("\tTEST AL,AL" NL);
+	outputf("\tJNZ .Lstrcat_%d_append" NL, id);
+	outputf("\tMOV EAX,[ESP]" NL);
+}
+static void inline_strcmp(void){
+	int id = inline_counter++;
+	outputf("\tMOV EDX,[ESP]" NL);
+	outputf("\tMOV ECX,[ESP+4]" NL);
+	outputf(".Lstrcmp_%d_loop:" NL, id);
+	outputf("\tMOV AL,[EDX]" NL);
+	outputf("\tMOV AH,[ECX]" NL);
+	outputf("\tCMP AL,AH" NL);
+	outputf("\tJNE .Lstrcmp_%d_diff" NL, id);
+	outputf("\tTEST AL,AL" NL);
+	outputf("\tJE .Lstrcmp_%d_eq" NL, id);
+	outputf("\tINC EDX" NL);
+	outputf("\tINC ECX" NL);
+	outputf("\tJMP .Lstrcmp_%d_loop" NL, id);
+	outputf(".Lstrcmp_%d_diff:" NL, id);
+	outputf("\tMOVZX EDX,AH" NL);
+	outputf("\tMOVZX EAX,AL" NL);
+	outputf("\tSUB EAX,EDX" NL);
+	outputf("\tJMP .Lstrcmp_%d_done" NL, id);
+	outputf(".Lstrcmp_%d_eq:" NL, id);
+	outputf("\tXOR EAX,EAX" NL);
+	outputf(".Lstrcmp_%d_done:" NL, id);
+}
+static void inline_memcpy(void){
+	int id = inline_counter++;
+	outputf("\tMOV EAX,[ESP]" NL);
+	outputf("\tMOV ECX,[ESP+4]" NL);
+	outputf("\tMOV EDX,[ESP+8]" NL);
+	outputf("\tTEST EDX,EDX" NL);
+	outputf("\tJZ .Lmemcpy_%d_done" NL, id);
+	outputf("\tPUSH ESI" NL);
+	outputf("\tPUSH EDI" NL);
+	outputf("\tMOV EDI,EAX" NL);
+	outputf("\tMOV ESI,ECX" NL);
+	outputf("\tMOV ECX,EDX" NL);
+	outputf("\tSHR ECX,2" NL);
+	outputf("\tREP MOVSD" NL);
+	outputf("\tMOV ECX,EDX" NL);
+	outputf("\tAND ECX,3" NL);
+	outputf("\tREP MOVSB" NL);
+	outputf("\tPOP EDI" NL);
+	outputf("\tPOP ESI" NL);
+	outputf(".Lmemcpy_%d_done:" NL, id);
+	outputf("\tMOV EAX,[ESP]" NL);
+}
+static void inline_memset(void){
+	int id = inline_counter++;
+	outputf("\tMOV EDX,[ESP]" NL);
+	outputf("\tMOV ECX,[ESP+8]" NL);
+	outputf("\tMOVZX EAX,BYTE [ESP+4]" NL);
+	outputf("\tPUSH EDI" NL);
+	outputf("\tMOV EDI,EDX" NL);
+	outputf("\tREP STOSB" NL);
+	outputf("\tPOP EDI" NL);
+	outputf("\tMOV EAX,[ESP]" NL);
+}
+
+
 
 
 static UCHAR *convmain(UCHAR *src0, UCHAR *src1, UCHAR *dest0, UCHAR *dest1, struct STR_FLAGS flags)
@@ -955,13 +1211,17 @@ ext_skip2:
 			if (p[-1] == 0x00) {
 				if (dest0_ + 8 + p[-2] + LEN_NL > p)
 					goto err;
+				if(flags.opt[FLAG_no_extern]==1)
+					goto skip_extern;
 				output(8, "\tEXTERN\t");
 				output(p[-2], p);
 				output(LEN_NL, NL);
 			}
+skip_extern:
 			p += p[-2];
 		} while (p < q);
 	}
+
 
 	/* 一般变换 */
 	flag2 = 1;
@@ -1183,17 +1443,44 @@ ext_skip2:
 			}
 			if (src0[1] == 's' && src0[2] == 'p' && src0[3] == 'a' && src0[4] == 'c' && src0[5] == 'e' && src0[6] <= ' ') {
 				/* .space */
-				/* yi_xi_yun注：非.bss段实际上不应该用RESB而是用TIMES N DB 0 
-				但实际上因非.bss段是物理上写入文件的，nasm规定此时使用RESB等价于用0填充 
-				故这种写法理论上正确，只是会被nasm报警告*/
+				/* UPDATE */
+				/* 注：原作者统一用RESB非.bss段实际上不应该用RESB而是用TIMES N DB 0，但实际上因非.bss段是物理上写入文件的，
+				nasm规定此时使用RESB等价于用0填充，故原写法理论上正确，只是会被nasm报警告
+				修改后的部分，按段区分RESB或TIMES DB 0*/
 				src0 = skipspace(src0 + 6);
 				p = getparam(src0);
-				output(6, "\tRESB\t");
-				output(p - src0, src0);
+				if(currentsection==SECTION_BSS){
+					output(6, "\tRESB\t");
+					output(p - src0, src0);
+				}else{
+					output(7, "\tTIMES\t");
+					output(p - src0, src0);
+					output(5, "\tDB\t0");	
+				}
 				src0 = p;
 				output(LEN_NL, NL);
 				goto skip;
 			}
+			/*NEW：.zero和.skip的处理，与.space一致。
+			.zero/.skip和.space同义，不确定GCC是否会生成，但加上总归更好。 
+			从这里开始*/
+			if((src0[1] == 'z' && src0[2] == 'e' && src0[3] == 'r' && src0[4] == 'o' && src0[5] <= ' ') ||
+			   (src0[1] == 's' && src0[2] == 'k' && src0[3] == 'i' && src0[4] == 'p' && src0[5] <= ' ')){
+			   	src0 = skipspace(src0 + 5);
+				p = getparam(src0);
+				if(currentsection==SECTION_BSS){
+					output(6, "\tRESB\t");
+					output(p - src0, src0);
+				}else{
+					output(7, "\tTIMES\t");
+					output(p - src0, src0);
+					output(5, "\tDB\t0");	
+				}
+				src0 = p;
+				output(LEN_NL, NL);
+				goto skip;
+			} 
+			/*到这里结束*/
 			if (src0[1] == 'l' && src0[2] == 'o' && src0[3] == 'n' && src0[4] == 'g' && src0[5] <= ' ') {
 				/* .long */
 				src0 += 5;
@@ -1382,6 +1669,31 @@ retry:
 				}
 			}
 		}
+		/* NEW: C库函数的内联展开*/
+		/*支持strlen/strcpy/strcmp/strcat/memcpy/memset*/
+		if(flags.opt[FLAG_i]){
+			if(r = opcmp("call ", src0)){
+				if(my_strcmp(r, "_strlen")){
+					inline_strlen();goto skip;
+				}
+				if(my_strcmp(r, "_strcpy")){
+					inline_strcpy();goto skip;
+				}
+				if(my_strcmp(r, "_strcat")){
+					inline_strcat();goto skip;
+				}
+				if(my_strcmp(r, "_strcmp")){
+					inline_strcmp();goto skip;
+				}
+				if(my_strcmp(r, "_memcpy")){
+					inline_memcpy();goto skip;
+				}
+				if(my_strcmp(r, "_memset")){
+					inline_memset();goto skip;
+				}
+			}
+		}
+		
 
 		/* 单参数指令 */
 		for (i = 0; q = &one_param[i][0], *q != '\0'; i++) {
